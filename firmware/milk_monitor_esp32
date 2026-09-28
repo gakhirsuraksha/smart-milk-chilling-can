@@ -1,0 +1,383 @@
+/*
+  Milk Chilling Can Monitor — ESP32 Firmware
+  -------------------------------------------
+  Reads a DS18B20 temperature probe and an analog pH sensor, pushes both to
+  Firebase Realtime Database, drives a local buzzer/LED failsafe alert, and
+  switches a Peltier cooling relay automatically when the milk is above
+  TEMP_THRESHOLD. Also classifies milk freshness
+  (fresh / early souring / spoiling) from the pH reading.
+
+  Firebase data model — one node PER CAN, keyed by CAN_ID below, so multiple
+  cans (each running this same firmware with a different CAN_ID) never
+  overwrite each other. The website (index.html) listens on /milkCans and
+  matches keys case-insensitively to the can IDs shown in its table:
+    /milkCans
+      /<CAN_ID>                e.g. "CAN-01"
+        /temperature    float
+        /phLevel        float
+        /freshness      "fresh" | "souring" | "spoiling"
+        /status         "normal" | "alert" | "sensor-error"
+        /lastUpdated    unix timestamp (seconds)
+
+  IMPORTANT for multi-can setups: change CAN_ID below to a unique value for
+  each physical can before flashing (e.g. "CAN-01", "CAN-02", ...). Each
+  can's QR code links to the website with that same ID as a URL parameter
+  (e.g. https://your-site.web.app?can=CAN-02).
+
+  Wiring:
+    DS18B20 data pin      -> GPIO 26   (with a 4.7k pull-up resistor to 3.3V)
+    Buzzer/LED failsafe   -> GPIO 5
+    Peltier relay         -> GPIO 25   (drives the relay module's IN/signal
+                                         pin — do NOT wire the Peltier module
+                                         directly to a GPIO, it draws far more
+                                         current than the pin can source)
+    pH sensor analog out  -> GPIO 34   (ADC1, input-only pin — safe choice on ESP32)
+
+  Libraries required (install via Arduino Library Manager):
+    - "Firebase ESP32 Client" by Mobizt
+    - "OneWire" by Jim Studt / Paul Stoffregen
+    - "DallasTemperature" by Miles Burton
+
+  pH calibration (IMPORTANT — do this before trusting any pH/freshness reading):
+    1. Upload this firmware once and open Serial Monitor.
+    2. Dip the probe in pH 7.0 buffer solution, let it settle ~30s, note the
+       printed raw voltage, and set PH7_VOLTAGE to that value below.
+    3. Dip the probe in pH 4.0 buffer solution, let it settle ~30s, note the
+       printed raw voltage, and set PH4_VOLTAGE to that value below.
+    4. Re-upload. Readings (and therefore the freshness band) will be
+       inaccurate until this calibration is done.
+
+  Freshness bands (must match the thresholds used in website/index.html):
+    pH >= 6.4        -> "fresh"     (green)
+    6.0 <= pH < 6.4   -> "souring"   (yellow/amber)
+    pH < 6.0          -> "spoiling"  (red)
+
+  Board: any ESP32 dev board, Arduino core for ESP32 installed via Boards Manager.
+*/
+
+#include <WiFi.h>
+#include <FirebaseESP32.h>
+#include <addons/TokenHelper.h>   // prints token status to Serial for debugging
+#include <OneWire.h>
+#include <esp_task_wdt.h>          // hardware watchdog — auto-recovers from full freezes
+#include <esp_system.h>            // reset reason reporting
+#include <DallasTemperature.h>
+#include <time.h>
+
+// ---------------- USER CONFIG — fill these in before uploading ----------------
+#define WIFI_SSID       "Garneil"
+#define WIFI_PASSWORD   "1234567890"
+
+#define API_KEY         "AIzaSyC12PB0P_-OZ3V1T6ikQvdSz0wy9nKPC8M"
+#define DATABASE_URL    "https://chilling-can-default-rtdb.asia-southeast1.firebasedatabase.app"
+// --------------------------------------------------------------------------------
+
+#define CAN_ID          "CAN-01"      // MUST be unique per physical can — must match the ID on the website
+const String CAN_BASE_PATH = "/milkCans/" + String(CAN_ID);
+#define TEMP_THRESHOLD  8.0f          // °C — must match TEMP_THRESHOLD in website/index.html
+
+#define ONE_WIRE_PIN    26            // DS18B20 data pin (checked first). If the probe is on another
+                                      // pin the sketch finds it automatically and tells you in Serial.
+#define BUZZER_PIN      5             // local failsafe buzzer/LED
+#define PELTIER_PIN     25            // relay module driving the Peltier module
+#define RELAY_ACTIVE_LOW true         // most 1/2/4-channel relay boards switch ON when the pin is LOW. Set false if yours is active-HIGH.
+#define PH_SENSOR_PIN   34            // pH sensor analog output (ADC1 pin)
+
+// ---- pH calibration — fill these in using the two-point calibration
+// process in the header comment above. These placeholder values are NOT
+// accurate and will give a wrong freshness reading until calibrated. ----
+#define PH7_VOLTAGE     2.50f         // raw voltage reading in pH 7.0 buffer
+#define PH4_VOLTAGE     2.03f         // raw voltage reading in pH 4.0 buffer
+
+// ---- Demo mode — no pH sensor wired in yet ----
+// While true, readPH() ignores GPIO 34 entirely and instead simulates a
+// milk sample slowly souring over a ~2 minute repeating cycle, so the
+// freshness pill on the website visibly moves through fresh -> souring ->
+// spoiling -> resets, without any real hardware. Flip this to false once a
+// real pH probe is wired in and calibrated (see instructions above).
+#define PH_DEMO_MODE true
+#define PH_FRESH_MIN    6.4f          // pH >= this -> "fresh"
+#define PH_SOURING_MIN  6.0f          // pH >= this (but < PH_FRESH_MIN) -> "souring"; below -> "spoiling"
+
+#define READ_INTERVAL_MS      3000    // how often to sample the sensor + push telemetry
+
+// If loop() ever fully hangs (e.g. a Firebase call blocks forever on a bad
+// connection — this has been observed with this library), the ESP32 will
+// force-reboot itself after this many seconds of silence, rather than
+// staying frozen until someone notices and power-cycles it by hand.
+#define WATCHDOG_TIMEOUT_SEC  20
+
+OneWire oneWire(ONE_WIRE_PIN);
+DallasTemperature sensors(&oneWire);
+int oneWirePin = ONE_WIRE_PIN;   // pin the probe was actually found on
+
+// Looks for a DS18B20 on ONE_WIRE_PIN first, then on other common free GPIOs, so a
+// mismatch between the sketch and your wiring can't silently break temperature reading.
+void detectTempSensor() {
+  const uint8_t candidates[] = { ONE_WIRE_PIN, 4, 26, 27, 14, 13, 16, 17, 18, 19, 21, 22, 23, 32, 33 };
+  for (uint8_t pin : candidates) {
+    if (pin == PELTIER_PIN || pin == PH_SENSOR_PIN || pin == BUZZER_PIN) continue;
+    oneWire.begin(pin);
+    sensors.begin();
+    if (sensors.getDeviceCount() > 0) {
+      oneWirePin = pin;
+      Serial.printf("DS18B20 found on GPIO %d\n", pin);
+      if (pin != ONE_WIRE_PIN) Serial.printf("  -> Tip: set ONE_WIRE_PIN to %d in the sketch.\n", pin);
+      return;
+    }
+  }
+  Serial.println("NO DS18B20 found on any pin. Check: 3.3V, GND, data wire, and a 4.7k resistor between data and 3.3V.");
+  oneWire.begin(ONE_WIRE_PIN);
+  sensors.begin();
+}
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+unsigned long lastReadMs = 0;
+
+bool firebaseReady = false;
+unsigned long lastAuthAttemptMs = 0;
+#define AUTH_RETRY_MS 5000   // how often to retry sign-up if not yet authenticated
+
+
+void connectWiFi() {
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+    delay(300);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\nWiFi connect timed out — will keep retrying in background");
+  }
+}
+
+void setupTime() {
+  // Needed so /lastUpdated is a real unix timestamp the website can format.
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.print("Syncing time");
+  time_t now = time(nullptr);
+  unsigned long start = millis();
+  while (now < 8 * 3600 * 2 && millis() - start < 15000) {
+    delay(300);
+    Serial.print(".");
+    now = time(nullptr);
+  }
+  Serial.println(" done");
+}
+
+// Attempts an anonymous Firebase sign-in. Called from setup(), and retried
+// from loop() if it hasn't succeeded yet — covers the case where WiFi wasn't
+// up yet, or the first attempt hit a transient network error. Without this
+// retry, a single failed sign-up at boot would leave the device permanently
+// unauthenticated (every Firebase.setX()/getX() call would keep failing
+// with "missing required credentials...") until physically rebooted.
+void attemptFirebaseSignUp() {
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println("Firebase anonymous sign-up OK");
+    firebaseReady = true;
+  } else {
+    Serial.printf("Firebase sign-up failed: %s\n", config.signer.signupError.message.c_str());
+    Serial.println("  -> Will retry. Check that Anonymous auth is enabled in the Firebase console.");
+    firebaseReady = false;
+  }
+}
+
+void setupFirebase() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  // The Firebase ESP32 library needs a signed-in user — even an anonymous
+  // one — before it will send ANY request. This is a library requirement,
+  // separate from your database rules: open rules (.read/.write: true) only
+  // control who's ALLOWED to access data once a request is actually sent.
+  //
+  // Requires: Firebase console -> Authentication -> Sign-in method ->
+  // Anonymous -> enabled.
+  config.token_status_callback = tokenStatusCallback; // logs token refresh events to Serial
+  attemptFirebaseSignUp();
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+void applyPeltierState(bool relayOn) {
+  bool level = RELAY_ACTIVE_LOW ? !relayOn : relayOn;
+  digitalWrite(PELTIER_PIN, level ? HIGH : LOW);
+}
+
+// Reads the pH sensor, averaging several samples to reduce noise, then
+// converts the raw voltage to a pH value using the two-point calibration
+// constants above. Prints the raw voltage too, since that's what you need
+// to read off during calibration.
+float readPH() {
+#if PH_DEMO_MODE
+  // Simulated reading — see PH_DEMO_MODE comment above. Cycles from a fresh
+  // 6.8 down to a spoiling 5.3 over 2 minutes, then repeats, with a little
+  // random jitter so it doesn't look like an obviously fake straight line.
+  float cyclePosition = fmodf(millis() / 1000.0f, 120.0f);   // 0-120s, repeating
+  float simulatedPh = 6.8f - (cyclePosition / 120.0f) * 1.5f; // 6.8 -> 5.3
+  simulatedPh += random(-5, 6) / 100.0f;                      // ±0.05 jitter
+  Serial.printf("pH DEMO MODE (no sensor) — simulated value: %.2f\n", simulatedPh);
+  return simulatedPh;
+#else
+  const int samples = 20;
+  long total = 0;
+  for (int i = 0; i < samples; i++) {
+    total += analogRead(PH_SENSOR_PIN);
+    delay(5);
+  }
+  float avgReading = total / (float)samples;
+  float voltage = avgReading / 4095.0f * 3.3f;   // ESP32 ADC: 12-bit, 3.3V reference
+
+  float slope = (PH4_VOLTAGE - PH7_VOLTAGE) / (4.0f - 7.0f);
+  float ph = 7.0f + (voltage - PH7_VOLTAGE) / slope;
+
+  Serial.printf("pH raw voltage: %.3f V (use this to calibrate PH7_VOLTAGE/PH4_VOLTAGE)\n", voltage);
+  return ph;
+#endif
+}
+
+// Classifies the current pH into a freshness band. Thresholds are rough
+// starting points — refine them against real observed spoilage in testing.
+String getFreshnessLabel(float ph) {
+  if (ph >= PH_FRESH_MIN) return "fresh";
+  if (ph >= PH_SOURING_MIN) return "souring";
+  return "spoiling";
+}
+
+void setup() {
+  Serial.begin(115200);   // Serial Monitor must be set to 115200 baud
+  delay(1500);
+  Serial.println("\n=== Milk can monitor starting (Serial Monitor must be at 115200 baud) ===");
+
+  esp_reset_reason_t resetReason = esp_reset_reason();
+  Serial.print("Boot reason: ");
+  switch (resetReason) {
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:
+      Serial.println("WATCHDOG TIMEOUT — the previous run froze and was auto-recovered");
+      break;
+    case ESP_RST_POWERON:
+      Serial.println("power-on (normal)");
+      break;
+    case ESP_RST_BROWNOUT:
+      Serial.println("BROWNOUT — check your power supply, this usually means voltage sagged (e.g. relay/Peltier switching)");
+      break;
+    default:
+      Serial.printf("code %d\n", resetReason);
+  }
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(PELTIER_PIN, OUTPUT);
+  pinMode(PH_SENSOR_PIN, INPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  applyPeltierState(false);   // relay OFF at boot (old code drove LOW, which switched an active-low relay ON)
+
+  detectTempSensor();
+
+  connectWiFi();
+  setupTime();
+  setupFirebase();
+
+  // Arm the watchdog last, after the (slower, one-time) WiFi/time/Firebase
+  // setup calls above — those can legitimately take longer than
+  // WATCHDOG_TIMEOUT_SEC on a slow network, and we don't want a false
+  // reboot during normal startup.
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  // Arduino-ESP32 core 3.x: init takes a config struct, and the task WDT is
+  // already running, so reconfigure it instead.
+  esp_task_wdt_config_t wdtConfig = {
+    .timeout_ms = WATCHDOG_TIMEOUT_SEC * 1000,
+    .idle_core_mask = 0,
+    .trigger_panic = true
+  };
+  esp_task_wdt_reconfigure(&wdtConfig);
+#else
+  esp_task_wdt_init(WATCHDOG_TIMEOUT_SEC, true);  // core 2.x: true = reboot on timeout
+#endif
+  esp_task_wdt_add(NULL);                          // watch the current (loop) task
+}
+
+// Sends one batched update to /milkCans/<CAN_ID>. One HTTPS round-trip
+// instead of several. Returns true on success.
+bool pushToFirebase(FirebaseJson &json) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected — cooling still runs locally, but the website won't update");
+    return false;
+  }
+  if (!firebaseReady || !Firebase.ready()) {
+    Serial.println("Firebase not authenticated yet — retrying sign-up in background");
+    return false;
+  }
+  if (!Firebase.updateNode(fbdo, CAN_BASE_PATH, json)) {
+    Serial.println("Firebase update FAILED: " + fbdo.errorReason());
+    Serial.println("  -> 'permission denied' = fix your database rules; 'token' errors = enable Anonymous sign-in.");
+    return false;
+  }
+  Serial.println("Firebase update OK -> " + CAN_BASE_PATH);
+  return true;
+}
+
+void loop() {
+  esp_task_wdt_reset();   // "I'm still alive" — if this isn't called for
+                           // WATCHDOG_TIMEOUT_SEC seconds (e.g. loop() is
+                           // stuck inside a hung Firebase call), the ESP32
+                           // force-reboots itself automatically.
+  unsigned long nowMs = millis();
+
+  if (!firebaseReady && WiFi.status() == WL_CONNECTED && nowMs - lastAuthAttemptMs >= AUTH_RETRY_MS) {
+    lastAuthAttemptMs = nowMs;
+    attemptFirebaseSignUp();
+  }
+
+  if (nowMs - lastReadMs < READ_INTERVAL_MS) return;
+  lastReadMs = nowMs;
+
+  sensors.requestTemperatures();
+  float tempC = sensors.getTempCByIndex(0);
+  time_t nowSec = time(nullptr);
+  FirebaseJson json;
+
+  // -127 = probe not found; 85.0 = the DS18B20 power-on default (bad wiring / no pull-up).
+  if (tempC == DEVICE_DISCONNECTED_C || tempC == 85.0f) {
+    Serial.printf("Sensor read error (%.1f) — check DS18B20 wiring (probe last looked for on GPIO %d)\n", tempC, oneWirePin);
+    static int errorCount = 0;
+    if (++errorCount % 5 == 0) detectTempSensor();   // re-scan pins every ~15 s in case it was wired late
+    digitalWrite(BUZZER_PIN, HIGH);   // fail-safe: sound the alert if we can't measure
+    // Still report to Firebase so the website shows "Sensor error" instead of silently going stale.
+    json.set("status", "sensor-error");
+    json.set("canId", String(CAN_ID));
+    json.set("lastUpdated", (int)nowSec);
+    pushToFirebase(json);
+    return;
+  }
+
+  bool overThreshold = tempC > TEMP_THRESHOLD;
+  String status = overThreshold ? "alert" : "normal";
+
+  float ph = readPH();
+  String freshness = getFreshnessLabel(ph);
+
+  // Local failsafe alert — fires independent of WiFi/Firebase.
+  digitalWrite(BUZZER_PIN, overThreshold ? HIGH : LOW);
+
+  // Automatic cooling: relay on while the milk is above the threshold.
+  applyPeltierState(overThreshold);
+
+  Serial.printf("Temp: %.2f C | pH: %.2f (%s) | status: %s | cooling: %s\n",
+                tempC, ph, freshness.c_str(), status.c_str(), overThreshold ? "ON" : "OFF");
+
+  json.set("temperature", tempC);
+  json.set("phLevel", ph);
+  json.set("freshness", freshness);
+  json.set("status", status);
+  json.set("canId", String(CAN_ID));
+  json.set("lastUpdated", (int)nowSec);
+  pushToFirebase(json);
+}
