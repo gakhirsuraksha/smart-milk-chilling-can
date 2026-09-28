@@ -248,7 +248,7 @@
   <header class="masthead">
     <div class="brand">
       <h1>Milk Producers' Co-operative</h1>
-      <p>Collection centre 04 · Kolasib route · <span id="clock">—</span></p>
+      <p>Collection centre 04 · Kolasib route · <span id="clock">—</span> · <span id="dbStatus">Connecting…</span></p>
     </div>
     <div class="masthead-actions">
       <button class="btn" id="alertBtn">Turn on alerts</button>
@@ -313,15 +313,15 @@
   </div>
 </div>
 
-<!-- Firebase (compat build). Running this file locally you can also use the
-     https://www.gstatic.com/firebasejs/10.12.2/... URLs instead. -->
-<script src="https://cdn.jsdelivr.net/npm/firebase@10.12.2/firebase-app-compat.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/firebase@10.12.2/firebase-database-compat.js"></script>
+<!-- Firebase (compat build), loaded from Google's own CDN. -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 
 <script>
 /* =========================================================================
    Smart Two-Tier Milk Chilling — collection centre dashboard
-   CAN-01 is the live prototype (ESP32 -> Firebase Realtime DB, node milkCan).
+   CAN-01 is the live prototype (ESP32 -> Firebase Realtime DB, node milkCans/<CAN_ID>).
    The remaining cans are simulated so the fleet view can be demonstrated.
    ========================================================================= */
 
@@ -330,6 +330,8 @@ const PH_FRESH_MIN = 6.4, PH_SOURING_MIN = 6.0;
 const EXPOSURE_CAUTION = 15;   // minutes above 8 degC before it is flagged
 const EXPOSURE_DANGER  = 45;
 const MAX_POINTS = 40;
+const el = id => document.getElementById(id);
+const STALE_MS = 20000;      // live can with no update for this long is shown as offline
 
 /* ---------- the fleet ---------- */
 const cans = {
@@ -349,7 +351,11 @@ const lastVerdict = {};
    signal — it falls as lactic acid builds up. */
 function assess(can) {
   const { temp, ph, exposure } = can;
+  if (can.sensorError)
+    return { band: "caution", label: "Sensor error", why: "The ESP32 is online but cannot read the DS18B20 probe. Check its data wire, the 4.7k pull-up resistor and the GPIO pin in the sketch." };
   if (temp === null) return { band: "caution", label: "No reading", why: "This can has not reported since it was added." };
+  if (can.live && can.updated && Date.now() - can.updated > STALE_MS)
+    return { band: "caution", label: "Offline", why: `No data received for ${relTime(can.updated)}. Check the ESP32's power and WiFi — its local buzzer still works without a connection.` };
 
   if (ph !== null && ph < PH_SOURING_MIN)
     return { band: "danger", label: "Danger", why: "pH has fallen below 6.0. Souring is already under way — divert this can for testing before it joins the bulk tank." };
@@ -382,7 +388,7 @@ function freshnessNote(ph) {
 function record(can, temp, ph) {
   const now = Date.now();
   if (can.history.length) {
-    const gapMin = (now - can.history[can.history.length - 1].t) / 60000;
+    const gapMin = Math.min(5, (now - can.history[can.history.length - 1].t) / 60000); // cap so an offline gap isn't counted as exposure
     if (temp > SAFE_MAX) can.exposure += gapMin;
   }
   can.temp = temp;
@@ -393,39 +399,143 @@ function record(can, temp, ph) {
 }
 
 /* ---------- live can ---------- */
+/* ---------- connection status shown in the header ---------- */
+let dbConnected = false, dbError = null;
+
+function refreshDbStatus() {
+  const s = el("dbStatus");
+  if (!s) return;
+  const live = Object.values(cans).filter(c => c.live && c.updated);
+  const newest = live.length ? Math.max(...live.map(c => c.updated)) : 0;
+  let text, color;
+  if (typeof forceDemo !== "undefined" && forceDemo) { text = "Demo mode (?demo=1) · not reading the database"; color = "var(--caution)"; }
+  else if (dbError) { text = dbError; color = "var(--danger)"; }
+  else if (!dbConnected) { text = "Connecting to database…"; color = "var(--caution)"; }
+  else if (!newest) { text = "Database connected · waiting for ESP32"; color = "var(--caution)"; }
+  else if (Date.now() - newest > STALE_MS) { text = "Database connected · ESP32 offline (last data " + relTime(newest) + ")"; color = "var(--caution)"; }
+  else { text = "Live · ESP32 data " + relTime(newest); color = "var(--safe)"; }
+  if (dupKeys.length && !dbError) text += " · ignoring old duplicate node: " + dupKeys.join(", ");
+  s.textContent = text;
+  s.style.color = color;
+}
+
+/* ---------- live cans: ESP32 -> Firebase -> this page ---------- */
+let dupKeys = [];
+
+function onSnapshot(snap) {
+  dbError = null;
+  const all = snap.val();
+  if (!all) { refreshDbStatus(); return; }   // node exists but is empty: ESP32 hasn't written yet
+
+  // Keys that differ only by letter case (can-01 / CAN-01) are the same can. Old test runs
+  // often leave a stale copy behind, so for each can use ONLY the most recently updated node.
+  const groups = {};
+  Object.entries(all).forEach(([key, d]) => {
+    if (!d || typeof d !== "object") return;
+    (groups[key.toUpperCase()] = groups[key.toUpperCase()] || []).push({ key, d });
+  });
+  dupKeys = [];
+
+  Object.entries(groups).forEach(([id, list]) => {
+    list.sort((x, y) => (Number(y.d.lastUpdated) || 0) - (Number(x.d.lastUpdated) || 0));
+    list.slice(1).forEach(x => dupKeys.push(x.key));
+    const { key, d } = list[0];
+
+    let can = cans[id];
+    if (!can) {
+      can = cans[id] = { id, farmer: "Live sensor", route: "ESP32 link", live: true,
+                         temp: null, ph: null, updated: null, history: [], exposure: 0, log: [] };
+    } else if (!can.live) {
+      // a simulated/demo can is now reporting real data: drop the fake history
+      Object.assign(can, { live: true, demo: false, farmer: "Live sensor", route: "ESP32 link",
+                           temp: null, ph: null, updated: null, history: [], exposure: 0, log: [] });
+    }
+    can.dbKey = key;
+
+    if (d.lastUpdated === can.lastTs) return;   // nothing new for this can
+    can.lastTs = d.lastUpdated;
+
+    // The ESP32 reports status "sensor-error" when the DS18B20 can't be read.
+    if (d.status === "sensor-error") {
+      can.sensorError = true;
+      can.updated = Date.now();
+      return;
+    }
+    const t = (d.temperature === null || d.temperature === undefined) ? NaN : Number(d.temperature);
+    if (!isFinite(t)) return;
+    can.sensorError = false;
+    record(can, t, typeof d.phLevel === "number" ? d.phLevel : null);
+  });
+  if (dupKeys.length) console.warn("Ignoring older duplicate database node(s):", dupKeys.join(", "), "— delete them in the Firebase console.");
+  render();
+  refreshDbStatus();
+}
+
+function onDbError(err) {
+  console.error("Firebase read failed:", err);
+  dbError = (err && err.code === "PERMISSION_DENIED")
+    ? "Database blocked reads — set the Realtime Database rules to allow reading /milkCans"
+    : "Database error: " + (err && err.message ? err.message : err);
+  refreshDbStatus();
+}
+
 function startFirebase() {
-  if (typeof firebase === "undefined") return false;
+  if (typeof firebase === "undefined") { dbError = "Firebase library failed to load — check your internet connection"; return false; }
   try {
     firebase.initializeApp({
       apiKey: "AIzaSyC12PB0P_-OZ3V1T6ikQvdSz0wy9nKPC8M",
       databaseURL: "https://chilling-can-default-rtdb.asia-southeast1.firebasedatabase.app",
       projectId: "chilling-can"
     });
-    firebase.database().ref("milkCan").on("value", (snap) => {
-      const d = snap.val();
-      if (!d) return;
-      const can = cans["CAN-01"];
-      can.farmer = d.canId ? "Prototype " + d.canId : can.farmer;
-      record(can, Number(d.temperature) || 0, typeof d.phLevel === "number" ? d.phLevel : null);
-      render();
-    }, () => {});
+    const db = firebase.database();
+    db.ref(".info/connected").on("value", s => { dbConnected = !!s.val(); refreshDbStatus(); });
+
+    // Sign in anonymously first so this works even if your rules say "auth != null".
+    // If anonymous sign-in isn't enabled we just carry on (fine when rules are public).
+    const listen = () => db.ref("milkCans").on("value", onSnapshot, onDbError);
+    if (firebase.auth) {
+      firebase.auth().signInAnonymously()
+        .catch(e => console.warn("Anonymous sign-in skipped:", e.code))
+        .then(listen);
+    } else {
+      listen();
+    }
     return true;
-  } catch (e) { return false; }
+  } catch (e) {
+    console.error(e);
+    dbError = "Firebase failed to start: " + e.message;
+    return false;
+  }
 }
 
-if (!startFirebase()) {
-  // Firebase unreachable — keep CAN-01 on simulated data so the demo still runs.
-  cans["CAN-01"].live = false;
-  cans["CAN-01"].farmer = "Prototype (offline)";
-  cans["CAN-01"].temp = 5.4;
-  cans["CAN-01"].ph = 6.71;
-  cans["CAN-01"].updated = Date.now();
+/* ---------- CAN-01 demo fallback ----------
+   If Firebase can't be reached, or the ESP32 hasn't sent anything within 10 s,
+   CAN-01 shows realistic dummy readings so the page never looks empty.
+   The moment real data arrives, the demo data is discarded automatically.
+   Add ?demo=1 to the URL to force demo mode. */
+function startDemo(reason) {
+  const can = cans["CAN-01"];
+  if (can.live && can.updated) return;          // real data already arrived
+  const now = Date.now();
+  Object.assign(can, {
+    live: false, demo: true, farmer: "Demo data", route: reason,
+    temp: 5.4, ph: 6.71, updated: now, exposure: 0,
+    history: [], log: [{ t: now, text: "No ESP32 signal — showing demo readings" }]
+  });
+  for (let i = 24; i > 0; i--)
+    can.history.push({ t: now - i * 3000, temp: 5.4 + Math.sin(i / 4) * 0.6 + (Math.random() - 0.5) * 0.2 });
+  render();
 }
+
+const forceDemo = new URLSearchParams(location.search).get("demo") === "1";
+if (forceDemo) startDemo("Demo mode (?demo=1)");
+else if (!startFirebase()) startDemo("Firebase unreachable — demo data");
+else setTimeout(() => startDemo("Waiting for ESP32 — demo data"), 10000);
 
 /* ---------- simulation for the other cans ---------- */
 function seedHistory() {
   Object.values(cans).forEach(can => {
-    if (can.temp === null) return;
+    if (can.temp === null || can.demo) return;
     const now = Date.now();
     for (let i = 24; i > 0; i--) {
       const drift = (Math.random() - 0.45) * 0.8 + i * 0.05;
@@ -443,6 +553,11 @@ seedHistory();
 setInterval(() => {
   Object.values(cans).forEach(can => {
     if (can.live || can.temp === null) return;
+    if (can.demo) {
+      record(can, 5.5 + 1.2 * Math.sin(Date.now() / 40000) + (Math.random() - 0.5) * 0.2,
+                  6.7 + (Math.random() - 0.5) * 0.04);
+      return;
+    }
     const step = (Math.random() - 0.42) * 0.35;
     record(can, Math.max(2, Math.min(24, can.temp + step)),
            can.ph === null ? null : Math.max(5.6, Math.min(6.9, can.ph - Math.random() * 0.004)));
@@ -451,7 +566,6 @@ setInterval(() => {
 }, 4000);
 
 /* ---------- rendering ---------- */
-const el = id => document.getElementById(id);
 
 function relTime(ts) {
   if (!ts) return "—";
@@ -475,7 +589,7 @@ function renderFleet() {
     tr.tabIndex = 0;
     tr.innerHTML = `
       <td>
-        <div class="can-name">${can.live ? '<span class="live-dot"></span>' : ""}${can.id}</div>
+        <div class="can-name">${can.live ? `<span class="live-dot${can.updated && Date.now() - can.updated > STALE_MS ? " stale" : ""}"></span>` : ""}${can.id}</div>
         <div class="can-route">${can.route}</div>
       </td>
       <td class="reading">${can.temp === null ? "—" : can.temp.toFixed(1) + "°C"}</td>
@@ -615,6 +729,7 @@ el("confirmScan").addEventListener("click", () => {
 /* ---------- clock ---------- */
 setInterval(() => {
   el("clock").textContent = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  refreshDbStatus();
 }, 1000);
 el("clock").textContent = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
