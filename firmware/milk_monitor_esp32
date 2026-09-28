@@ -65,11 +65,11 @@
 #include <time.h>
 
 // ---------------- USER CONFIG — fill these in before uploading ----------------
-#define WIFI_SSID       "Garneil"
-#define WIFI_PASSWORD   "1234567890"
+#define WIFI_SSID       "WIFI_Name"
+#define WIFI_PASSWORD   "WIFI_PASS"
 
-#define API_KEY         "AIzaSyC12PB0P_-OZ3V1T6ikQvdSz0wy9nKPC8M"
-#define DATABASE_URL    "https://chilling-can-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define API_KEY         "API KEY"
+#define DATABASE_URL    "DB_URL"
 // --------------------------------------------------------------------------------
 
 #define CAN_ID          "CAN-01"      // MUST be unique per physical can — must match the ID on the website
